@@ -7,6 +7,10 @@
 另含容量核算：由 enter/leave 事件还原设备半开在场区间，结合容量规则
 把查询窗口切分为状态恒定的占用分段并标注超限明细。
 
+应急清场核验：由 enter/leave 事件还原清场开始时刻的在场名单（半开区间
+[enter, leave)），只核对这份起始名单；窗口内离开后又进入的设备必须再次
+离开并持续在外至截止时刻才算按时清场。
+
 门线穿越核算：在围栏有效区域内定义定向 GeoJSON LineString 门线，按设备
 时间重排轨迹，只承认线段对门线的单点横穿（proper crossing），穿越时刻按
 交点在线段上的时间比例插值。门线含三个及以上折点时，在整条门线层面归并
@@ -253,8 +257,97 @@ def compute_occupancy_segments(
     return segments
 
 
-# ---------- 门线穿越核算 ----------
+# ---------- 应急清场核验 ----------
 
+
+@dataclass
+class ClearanceDeviceResult:
+    """单台起始名单设备的清场核验结果。
+
+    status=cleared 时 last_leave_ts 为最后一次有效离开时刻（其所在半开区间
+    覆盖过开始时刻，且离开不晚于截止时刻）；status=remaining 时为 None。
+    """
+
+    device_id: str
+    status: str          # cleared | remaining
+    last_leave_ts: float | None
+
+
+@dataclass
+class ClearanceReport:
+    """清场任务核验报告：每台设备的结果（按设备 ID 排序）与人数汇总。"""
+
+    results: list[ClearanceDeviceResult]
+
+    @property
+    def initial_count(self) -> int:
+        return len(self.results)
+
+    @property
+    def cleared_count(self) -> int:
+        return sum(1 for r in self.results if r.status == "cleared")
+
+    @property
+    def remaining_count(self) -> int:
+        return sum(1 for r in self.results if r.status == "remaining")
+
+
+def compute_clearance_report(
+    events: list[tuple[str, str, float]],
+    start: float,
+    end: float,
+) -> ClearanceReport:
+    """由 enter/leave 事件还原清场核验结果。
+
+    - 在场区间一律按半开 [enter, leave) 重放：恰在开始时刻 enter 的设备计入
+      起始名单，恰在开始时刻 leave 的排除；截止时刻沿用同一边界（恰在截止
+      时刻 leave 算已清场，恰在截止时刻 enter 算未清场）。
+    - 只核对起始名单：窗口开始时不在场的设备，无论窗口内如何进出都不出现。
+    - 起始在场的设备在窗口内离开后又进入，必须再次离开并持续在外至截止
+      时刻才算 cleared；截止时刻仍在场（含未闭合的进入区间）为 remaining。
+    - 同设备同类型事件按 (ts, type) 稳定排序；未闭合的进入区间延伸到 +inf。
+    """
+    by_device: dict[str, list[tuple[float, str]]] = {}
+    for device_id, etype, ts in events:
+        if etype in (EVENT_ENTER, EVENT_LEAVE):
+            by_device.setdefault(device_id, []).append((ts, etype))
+
+    results: list[ClearanceDeviceResult] = []
+    for device_id, evs in by_device.items():
+        evs.sort(key=lambda e: (e[0], e[1]))
+        intervals: list[tuple[float, float]] = []
+        open_since: float | None = None
+        for ts, etype in evs:
+            if etype == EVENT_ENTER:
+                if open_since is None:
+                    open_since = ts
+            elif open_since is not None:
+                intervals.append((open_since, ts))
+                open_since = None
+        if open_since is not None:
+            intervals.append((open_since, math.inf))
+
+        # 起始名单：半开区间 [enter, leave) 覆盖开始时刻
+        initial = [iv for iv in intervals if iv[0] <= start < iv[1]]
+        if not initial:
+            continue
+
+        # 截止时刻仍在场（区间覆盖 end）即未清场；离开后又进入必须再次离开
+        if any(s <= end < e for s, e in intervals):
+            results.append(ClearanceDeviceResult(device_id, "remaining", None))
+            continue
+
+        # 最后有效离开时刻：截止时刻前（含恰在截止）最后一次离开。
+        # 覆盖开始时刻的区间此时必然已在截止前闭合；若期间又进入过，
+        # 取最后一次离开（再次离开必更晚）才是真正的清场时刻。
+        last_leave = max(e for s, e in intervals if e <= end)
+        results.append(ClearanceDeviceResult(device_id, "cleared", last_leave))
+
+    results.sort(key=lambda r: r.device_id)
+    return ClearanceReport(results=results)
+
+
+# ---------- 门线穿越核算 ----------
 
 @dataclass
 class GateLine:

@@ -17,6 +17,7 @@ from .engine import (
     GateLine,
     ProjectedFence,
     TrackPoint,
+    compute_clearance_report,
     compute_crossings,
     compute_events,
     compute_occupancy_segments,
@@ -25,6 +26,7 @@ from .engine import (
 from .models import (
     Base,
     CapacityRule,
+    ClearanceTask,
     Crossing,
     DeviceState,
     Event,
@@ -35,6 +37,10 @@ from .models import (
 from .schemas import (
     CapacityRuleCreate,
     CapacityRuleOut,
+    ClearanceDeviceOut,
+    ClearanceReportOut,
+    ClearanceTaskCreate,
+    ClearanceTaskOut,
     CrossingOut,
     DeviceStatusOut,
     EventOut,
@@ -75,8 +81,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算与定向门线穿越核算",
-    version="1.2.0",
+                "支持围栏容量核算、定向门线穿越核算与应急清场核验",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -226,6 +232,7 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
     db.query(CapacityRule).filter_by(fence_id=fence_id).delete()
     db.query(Crossing).filter_by(fence_id=fence_id).delete()
     db.query(GateLineRow).filter_by(fence_id=fence_id).delete()
+    db.query(ClearanceTask).filter_by(fence_id=fence_id).delete()
     db.delete(fence)
     db.commit()
 
@@ -592,6 +599,111 @@ def list_crossings(
             lon=c.lon,
         ))
     return result
+
+
+# ---------- 应急清场核验 ----------
+
+
+def clearance_task_out(task: ClearanceTask) -> ClearanceTaskOut:
+    return ClearanceTaskOut(
+        id=task.id,
+        fence_id=task.fence_id,
+        name=task.name,
+        start=to_iso(task.start_ts),
+        end=to_iso(task.end_ts),
+        created_at=to_iso(task.created_at),
+    )
+
+
+@app.post("/fences/{fence_id}/clearance-tasks", response_model=ClearanceTaskOut, status_code=201)
+def create_clearance_task(fence_id: int, body: ClearanceTaskCreate, db: Session = Depends(get_db)):
+    """为指定围栏创建应急清场任务（名称 + 开始时刻 + 截止时刻，开始必须早于截止）。
+
+    报告不保存快照：每次查询都从当前 enter/leave 事件现算，补录乱序轨迹点
+    触发事件重算后，再次查询即反映最新名单与结果。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    task = ClearanceTask(
+        fence_id=fence_id,
+        name=body.name,
+        start_ts=to_epoch(body.start),
+        end_ts=to_epoch(body.end),
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return clearance_task_out(task)
+
+
+@app.get("/fences/{fence_id}/clearance-tasks", response_model=list[ClearanceTaskOut])
+def list_clearance_tasks(fence_id: int, db: Session = Depends(get_db)):
+    """列出围栏的清场任务（按创建先后/id 升序）。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    rows = (
+        db.query(ClearanceTask)
+        .filter_by(fence_id=fence_id)
+        .order_by(ClearanceTask.id)
+        .all()
+    )
+    return [clearance_task_out(t) for t in rows]
+
+
+@app.get(
+    "/fences/{fence_id}/clearance-tasks/{task_id}/report",
+    response_model=ClearanceReportOut,
+)
+def clearance_report(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    """查询清场核验报告。
+
+    从当前 enter/leave 事件还原开始时刻的在场名单（半开 [enter, leave)：
+    恰在开始时刻 enter 计入、恰在开始时刻 leave 排除）；只核对这份起始名单，
+    窗口内离开后又进入的设备必须再次离开并持续在外至截止时刻才算 cleared。
+    报告每次查询现算，不保留旧快照。
+    """
+    task = db.get(ClearanceTask, task_id)
+    if task is None or task.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="清场任务不存在")
+
+    events = (
+        db.query(Event)
+        .filter(Event.fence_id == fence_id, Event.type.in_([EVENT_ENTER, EVENT_LEAVE]))
+        .all()
+    )
+    report = compute_clearance_report(
+        [(e.device_id, e.type, e.ts) for e in events],
+        task.start_ts,
+        task.end_ts,
+    )
+    return ClearanceReportOut(
+        task_id=task.id,
+        fence_id=task.fence_id,
+        name=task.name,
+        start=to_iso(task.start_ts),
+        end=to_iso(task.end_ts),
+        results=[
+            ClearanceDeviceOut(
+                device_id=r.device_id,
+                status=r.status,
+                last_leave_ts=to_iso(r.last_leave_ts),
+            )
+            for r in report.results
+        ],
+        initial_count=report.initial_count,
+        cleared_count=report.cleared_count,
+        remaining_count=report.remaining_count,
+    )
+
+
+@app.delete("/fences/{fence_id}/clearance-tasks/{task_id}", status_code=204)
+def delete_clearance_task(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    task = db.get(ClearanceTask, task_id)
+    if task is None or task.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="清场任务不存在")
+    db.delete(task)
+    db.commit()
 
 
 @app.get("/health")

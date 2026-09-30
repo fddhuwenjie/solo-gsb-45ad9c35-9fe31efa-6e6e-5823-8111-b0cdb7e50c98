@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -132,3 +132,52 @@ class CrossingOut(BaseModel):
     ts: datetime = Field(description="按交点比例插值得到的穿越时刻")
     lat: float = Field(description="交点纬度")
     lon: float = Field(description="交点经度")
+
+
+class ClearanceTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="清场任务名称")
+    start: datetime = Field(description="清场开始时刻（含），报告还原该时刻的在场名单")
+    end: datetime = Field(description="清场截止时刻，开始必须早于截止")
+
+    @model_validator(mode="after")
+    def check_window(self):
+        start = self.start
+        end = self.end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if not start < end:
+            raise ValueError("开始时刻必须早于截止时刻")
+        return self
+
+
+class ClearanceTaskOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    start: datetime
+    end: datetime
+    created_at: datetime
+
+
+class ClearanceDeviceOut(BaseModel):
+    device_id: str
+    status: Literal["cleared", "remaining"] = Field(
+        description="cleared=截止时刻前已清场（含恰在截止离开）；remaining=截止时刻仍在场"
+    )
+    last_leave_ts: datetime | None = Field(
+        description="cleared 时为最后有效离开时刻；remaining 时为 null"
+    )
+
+
+class ClearanceReportOut(BaseModel):
+    task_id: int
+    fence_id: int
+    name: str
+    start: datetime
+    end: datetime
+    results: list[ClearanceDeviceOut] = Field(description="每台起始名单设备的结果，按设备 ID 排序")
+    initial_count: int = Field(description="起始时刻在场人数（起始名单）")
+    cleared_count: int = Field(description="按时清场人数")
+    remaining_count: int = Field(description="未清场人数")
