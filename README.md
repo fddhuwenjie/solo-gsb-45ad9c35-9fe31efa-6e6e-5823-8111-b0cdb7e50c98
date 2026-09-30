@@ -8,6 +8,7 @@
 - 产出 `enter` / `leave` / `stay` 事件；**重复提交轨迹点不会重复产出事件**（幂等）
 - **围栏容量核算**：按生效时刻维护正整数容量上限规则，查询任意 `[start, end)` 窗口的占用分段与超限明细
 - **定向门线穿越核算**：围栏内保存简单 GeoJSON LineString 门线（正/反向名称 + 最小位移），只承认相邻轨迹点对门线的**单点横穿**，穿越时刻按交点比例插值
+- **应急清场核验**：为围栏创建含名称、开始时刻、截止时刻的清场任务；报告从 enter/leave 事件实时还原起始在场名单并逐机核验 cleared/remaining
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -237,13 +238,79 @@ curl 'http://localhost:8000/crossings?device_id=dev-001&start=2026-09-22T08:00:0
 | 轨迹端点在折点 | `(39.910,116.315)` → `(39.911,116.314)` | 交点恰在轨迹端点，忽略 |
 | 沿门线段穿折点 | `(39.910,116.312)` → `(39.910,116.317)` | 与西→东门线段共线（沿线），忽略 |
 
+### 10. 应急清场核验
+
+为围栏创建清场任务（名称 + 开始时刻 + 截止时刻，开始必须严格早于截止）：
+
+```bash
+curl -X POST http://localhost:8000/fences/1/clearance-tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "台风应急清场",
+    "start_at": "2026-09-30T12:02:00Z",
+    "deadline": "2026-09-30T12:06:00Z"
+  }'
+```
+
+返回 `201` 及任务对象（含 `id`，下文假设为 `1`）。开始时刻不早于截止时刻返回 `422`，围栏不存在返回 `404`。
+管理接口：`GET /fences/1/clearance-tasks`（按 id 升序）、`DELETE /fences/1/clearance-tasks/{task_id}`；**删除围栏时其清场任务一并删除**。
+
+提交一段示例轨迹（围栏配置了 50m 离开缓冲与 10s 停留确认，故界外点取缓冲带外，且每次状态变化都补了确认点）：
+
+```bash
+curl -X POST http://localhost:8000/points -H 'Content-Type: application/json' \
+  -d '{"points": [
+    {"device_id": "dev-001", "ts": "2026-09-30T12:01:40Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-001", "ts": "2026-09-30T12:01:55Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-001", "ts": "2026-09-30T12:02:50Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-001", "ts": "2026-09-30T12:03:05Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:02:00Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:02:15Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:03:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:03:30Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:03:40Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-002", "ts": "2026-09-30T12:04:00Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-003", "ts": "2026-09-30T12:02:30Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-003", "ts": "2026-09-30T12:04:00Z", "lat": 39.905, "lon": 116.305}
+  ]}'
+
+curl http://localhost:8000/fences/1/clearance-tasks/1/report
+```
+
+返回示例：
+
+```json
+{
+  "id": 1,
+  "fence_id": 1,
+  "name": "台风应急清场",
+  "start_at": "2026-09-30T12:02:00Z",
+  "deadline": "2026-09-30T12:06:00Z",
+  "created_at": "2026-09-30T11:50:00Z",
+  "summary": {"start_count": 2, "cleared_count": 1, "remaining_count": 1},
+  "devices": [
+    {"device_id": "dev-001", "status": "cleared", "last_leave_at": "2026-09-30T12:02:50Z"},
+    {"device_id": "dev-002", "status": "remaining", "last_leave_at": null}
+  ]
+}
+```
+
+**语义说明**：
+
+1. **起始名单还原**：报告由该围栏当前的 `enter`/`leave` 事件重放，在场区间一律按半开区间 **`[enter, leave)`** 处理。设备在开始时刻处于某个开着的区间内才进入起始名单——**恰在开始时刻 `enter` 的计入，恰在开始时刻 `leave` 的排除**。上例 `dev-002` 12:02:00 的轨迹点在开始时刻满足进入（事件时间取该时刻，计入名单），`dev-001` 开始前已在场（计入）；`dev-003` 12:02:30 才进入，开始时刻尚在场外，不在起始名单内，即使截止时仍在场也不核对。
+2. **半开边界贯穿截止**：截止时刻沿用同一边界——恰在截止时刻 `leave` 的设备已在外，计为 `cleared`；恰在截止时刻 `enter` 的设备在场，计为 `remaining`。
+3. **只核对起始名单**：窗口内首次进入的设备不参与汇总。
+4. **折返规则**：名单内设备在窗口内离开后又进入的，**必须再次离开并持续在外至截止**才算按时清场（`cleared`）。上例 `dev-002` 12:03:00 离开、12:03:40 又进入且未再离开，故仍为 `remaining`；若此后补录两个 12:04:30 之后的界外点使其再次离开并持续在外至截止，再查报告即变为 `cleared`，`last_leave_at` 取**最后一次有效离开时刻**（12:04:30）。截止时仍在场（含折返未走）的设备 `last_leave_at` 为 `null`。
+5. **汇总与排序**：`summary` 给出 `start_count`（起始人数）、`cleared_count`（按时清场）、`remaining_count`（未清场）；`devices` 按设备 ID 升序。
+6. **实时重建、无快照**：报告**每次查询都从当前事件重建**，不落库任何结果。补录乱序轨迹点触发事件重算后，再次查询得到的起始名单与 cleared/remaining 结果同步更新，不保留旧快照。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/fences` | 创建围栏（GeoJSON Polygon，支持孔洞，附判定配置） |
 | GET | `/fences` / `/fences/{id}` | 围栏列表 / 详情 |
-| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则 |
+| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务 |
 | POST | `/points` | 批量提交轨迹点（乱序重排、重复幂等） |
 | GET | `/events` | 事件查询（device_id / fence_id / type / start / end / limit / offset） |
 | GET | `/devices/{device_id}/status` | 设备当前相对各围栏的状态 |
@@ -255,6 +322,10 @@ curl 'http://localhost:8000/crossings?device_id=dev-001&start=2026-09-22T08:00:0
 | GET | `/fences/{id}/gates` | 门线列表（按 id 升序） |
 | DELETE | `/fences/{id}/gates/{gate_id}` | 删除门线及其穿越记录 |
 | GET | `/crossings` | 门线穿越查询（device_id / gate_id / fence_id / direction / start / end，半开窗口） |
+| POST | `/fences/{id}/clearance-tasks` | 新增应急清场任务（名称 + 开始/截止时刻，开始须早于截止） |
+| GET | `/fences/{id}/clearance-tasks` | 清场任务列表（按 id 升序） |
+| DELETE | `/fences/{id}/clearance-tasks/{task_id}` | 删除清场任务（删除围栏时一并删除） |
+| GET | `/fences/{id}/clearance-tasks/{task_id}/report` | 清场核验报告（实时由事件重建：起始名单 + cleared/remaining + 汇总） |
 | GET | `/health` | 健康检查 |
 
 ## 围栏配置参数
@@ -284,11 +355,11 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验）
 Dockerfile / docker-compose.yml
 ```
 

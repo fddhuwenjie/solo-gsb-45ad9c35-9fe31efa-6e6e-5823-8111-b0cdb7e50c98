@@ -132,3 +132,37 @@ class CrossingOut(BaseModel):
     ts: datetime = Field(description="按交点比例插值得到的穿越时刻")
     lat: float = Field(description="交点纬度")
     lon: float = Field(description="交点经度")
+
+
+class ClearanceTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="清场任务名称")
+    start_at: datetime = Field(description="清场开始时刻（ISO 8601），起始名单边界含该时刻")
+    deadline: datetime = Field(description="清场截止时刻（ISO 8601），必须晚于开始时刻")
+
+
+class ClearanceTaskOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    start_at: datetime
+    deadline: datetime
+    created_at: datetime
+
+
+class ClearanceDeviceOut(BaseModel):
+    device_id: str
+    status: Literal["cleared", "remaining"] = Field(description="按时清场 / 截止时仍在场")
+    last_leave_at: datetime | None = Field(
+        description="cleared 时为最后有效离开时刻；remaining 为 null"
+    )
+
+
+class ClearanceSummaryOut(BaseModel):
+    start_count: int = Field(description="起始名单人数")
+    cleared_count: int = Field(description="按时清场人数")
+    remaining_count: int = Field(description="截止时未清场人数")
+
+
+class ClearanceReportOut(ClearanceTaskOut):
+    summary: ClearanceSummaryOut
+    devices: list[ClearanceDeviceOut] = Field(description="起始名单设备的核验结果，按 ID 排序")

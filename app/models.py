@@ -86,3 +86,14 @@ class Crossing(Base):
     ts: Mapped[float] = mapped_column(Float, index=True)   # 插值得到的穿越时刻（epoch 秒）
     lat: Mapped[float] = mapped_column(Float)              # 交点纬度
     lon: Mapped[float] = mapped_column(Float)              # 交点经度
+
+
+class ClearanceTask(Base):
+    __tablename__ = "clearance_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    start_ts: Mapped[float] = mapped_column(Float)     # 清场开始时刻（epoch 秒，名单边界含）
+    deadline_ts: Mapped[float] = mapped_column(Float)  # 清场截止时刻（epoch 秒，须晚于开始）
+    created_at: Mapped[float] = mapped_column(Float)

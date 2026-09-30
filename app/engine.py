@@ -7,6 +7,11 @@
 另含容量核算：由 enter/leave 事件还原设备半开在场区间，结合容量规则
 把查询窗口切分为状态恒定的占用分段并标注超限明细。
 
+应急清场核验：为围栏定义清场窗口 [start, deadline)，由 enter/leave 事件
+还原起始时刻的在场名单（半开边界：start 处的 enter 计入、leave 排除），
+仅核对这份名单；设备离开后又进入必须再次离开并持续在外至 deadline 才算
+按时清场。
+
 门线穿越核算：在围栏有效区域内定义定向 GeoJSON LineString 门线，按设备
 时间重排轨迹，只承认线段对门线的单点横穿（proper crossing），穿越时刻按
 交点在线段上的时间比例插值。门线含三个及以上折点时，在整条门线层面归并
@@ -163,6 +168,34 @@ def compute_events(
 # ---------- 容量核算 ----------
 
 
+def presence_intervals(events: list[tuple[str, str, float]]) -> list[tuple[str, float, float]]:
+    """由 enter/leave 事件重放每台设备的半开在场区间 [enter, leave)。
+
+    输入为 (device_id, event_type, ts)；同时刻同设备事件按 (ts, 类型) 排序，
+    使 enter 先于 leave，与半开语义一致。未配对的 enter（最终仍未离开）
+    其区间止端取 +inf，交由调用方按窗口截断。
+    """
+    by_device: dict[str, list[tuple[float, str]]] = {}
+    for device_id, etype, ts in events:
+        if etype in (EVENT_ENTER, EVENT_LEAVE):
+            by_device.setdefault(device_id, []).append((ts, etype))
+
+    intervals: list[tuple[str, float, float]] = []  # (设备, 起, 止)
+    for device_id, evs in by_device.items():
+        evs.sort(key=lambda x: (x[0], 0 if x[1] == EVENT_ENTER else 1))
+        open_since: float | None = None
+        for ts, etype in evs:
+            if etype == EVENT_ENTER:
+                if open_since is None:
+                    open_since = ts
+            elif open_since is not None:
+                intervals.append((device_id, open_since, ts))
+                open_since = None
+        if open_since is not None:
+            intervals.append((device_id, open_since, math.inf))
+    return intervals
+
+
 @dataclass
 class OccupancySegment:
     """[start, end) 内状态恒定（在场设备集合与生效上限均不变）的占用分段。"""
@@ -200,35 +233,18 @@ def compute_occupancy_segments(
     - 相邻状态（在场设备集合 + 生效上限）相同的分段被合并，保证分段尽可能长。
     """
     # 1) 还原每台设备的半开在场区间 [enter, leave)
-    by_device: dict[str, list[tuple[float, str]]] = {}
-    for device_id, etype, ts in events:
-        if etype in (EVENT_ENTER, EVENT_LEAVE):
-            by_device.setdefault(device_id, []).append((ts, etype))
-
-    intervals: list[tuple[float, float, str]] = []  # (起, 止, 设备)
-    for device_id, evs in by_device.items():
-        evs.sort()
-        open_since: float | None = None
-        for ts, etype in evs:
-            if etype == EVENT_ENTER:
-                if open_since is None:
-                    open_since = ts
-            elif open_since is not None:
-                intervals.append((open_since, ts, device_id))
-                open_since = None
-        if open_since is not None:  # 仍未离开：延伸到 +inf，交由查询窗口截断
-            intervals.append((open_since, math.inf, device_id))
+    intervals = presence_intervals(events)
 
     # 2) 截断到查询窗口 [start, end)，丢弃窗口外的零长区间
     clipped = [
-        (max(s, start), min(e, end), dev)
-        for s, e, dev in intervals
+        (dev, max(s, start), min(e, end))
+        for dev, s, e in intervals
         if max(s, start) < min(e, end)
     ]
 
     # 3) 边界集合：同一时刻的进出与规则切换合并为一个原子边界
     boundaries = {start, end}
-    for cs, ce, _ in clipped:
+    for _dev, cs, ce in clipped:
         boundaries.add(cs)
         boundaries.add(ce)
     ordered_rules = sorted(rules)
@@ -240,7 +256,7 @@ def compute_occupancy_segments(
     # 4) 逐段求恒定状态，相邻同状态分段合并
     segments: list[OccupancySegment] = []
     for a, b in zip(ordered, ordered[1:]):
-        devices = tuple(sorted(dev for cs, ce, dev in clipped if cs <= a < ce))
+        devices = tuple(sorted(dev for dev, cs, ce in clipped if cs <= a < ce))
         limit: int | None = None
         for effective_from, cap in ordered_rules:
             if effective_from > a:
@@ -490,3 +506,78 @@ def compute_crossings(
             ))
     crossings.sort(key=lambda c: (c.ts, c.gate_id))
     return crossings
+
+
+# ---------- 应急清场核验 ----------
+
+
+CLEARED = "cleared"
+REMAINING = "remaining"
+
+
+@dataclass
+class ClearanceDeviceResult:
+    """单台起始名单设备的清场核验结果。"""
+
+    device_id: str
+    status: str               # cleared | remaining
+    last_leave_ts: float | None  # cleared 时为最后有效离开时刻；remaining 为 None
+
+
+@dataclass
+class ClearanceReport:
+    """清场核验报告：仅覆盖起始名单设备，按设备 ID 排序。"""
+
+    start: float
+    deadline: float
+    results: list[ClearanceDeviceResult]
+
+    @property
+    def start_count(self) -> int:
+        return len(self.results)
+
+    @property
+    def cleared_count(self) -> int:
+        return sum(1 for r in self.results if r.status == CLEARED)
+
+    @property
+    def remaining_count(self) -> int:
+        return sum(1 for r in self.results if r.status == REMAINING)
+
+
+def compute_clearance(
+    events: list[tuple[str, str, float]], start: float, deadline: float
+) -> ClearanceReport:
+    """由 enter/leave 事件还原 [start, deadline) 的应急清场核验报告。
+
+    在场区间一律按半开区间 [enter, leave) 处理：
+    - 起始名单 = 起始时刻在场的设备，即存在区间满足 enter <= start < leave。
+      start 处的 enter 计入（区间含 enter），start 处的 leave 排除
+      （区间不含 leave）；截止时刻沿用同一套半开边界。
+    - 只核对这份起始名单，窗口内才首次进入的设备不参与核验。
+    - cleared：设备在窗口内离开后持续在外至 deadline（存在 leave <= deadline
+      且之后没有任何区间在 deadline 仍开着）。离开后又进入的设备必须再次
+      离开并持续在外至 deadline，否则仍为 remaining。
+    - last_leave_ts 取截止前最后一次有效离开时刻（开着区间的最后一个止端）；
+      仍在场的设备该值为 None。
+    """
+    by_device: dict[str, list[tuple[float, float]]] = {}
+    for device_id, s, e in presence_intervals(events):
+        by_device.setdefault(device_id, []).append((s, e))
+
+    results: list[ClearanceDeviceResult] = []
+    for device_id, intervals in by_device.items():
+        # 起始名单：[enter, leave) 在 start 处开着
+        if not any(s <= start < e for s, e in intervals):
+            continue
+        # 截止状态：deadline 处仍有开着的区间即未清场；leave == deadline
+        # 属于区间止端，设备已在外，按半开边界计为 cleared。
+        open_at_deadline = [e for s, e in intervals if s <= deadline < e]
+        if open_at_deadline:
+            results.append(ClearanceDeviceResult(device_id, REMAINING, None))
+        else:
+            last_leave = max(e for s, e in intervals if e <= deadline)
+            results.append(ClearanceDeviceResult(device_id, CLEARED, last_leave))
+
+    results.sort(key=lambda r: r.device_id)
+    return ClearanceReport(start=start, deadline=deadline, results=results)
